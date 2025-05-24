@@ -52,65 +52,63 @@ LOSS_CONFIG = {
     # Ana loss ağırlıkları
     "weights": {
         "l1_weight": 1.0,
-        "l2_weight": 0.3,           # Biraz azaltıldı
-        "perceptual_weight": 0.2,   # Artırıldı - görsel kalite için kritik
-        "ms_ssim_weight": 0.15,     # Azaltıldı ama hala aktif
+        "l2_weight": 0.0,           # Bunu kapatıyorum. Gerektiğinde açılabilir.
+        "perceptual_weight": 0.5,   # 0.2'den artırıldı. görsel kalite için
+        "ms_ssim_weight": 0.0,     # Geçici olarak kapatıldı - perceptual ile çakışıyor 
         "vq_weight": 1.0,
         "entropy_weight": 0.01
     },
     
     # Perceptual loss konfigürasyonu
     "perceptual": {
-        "layers": ['relu_1_1', 'relu_2_1', 'relu_3_1', 'relu_4_1'],
-        "layer_weights": [0.25, 0.5, 0.75, 1.0]  # Daha derin katmanlara daha fazla ağırlık
+        "layers": ['relu_2_1', 'relu_3_1'],     # Daha az katman - hız kazancı
+        "layer_weights": [0.5, 0.5]  # Daha derin katmanlara daha fazla ağırlık. Ağırlıkları eşit yaptım ama 0.4 0.6 da yapılabilir.
     },
     
     # MS-SSIM konfigürasyonu
     "ms_ssim": {
         "data_range": 1.0,
-        "weights": [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+        "weights": [0.3, 0.4, 0.3],  # 5 yerine 3 scale
+        "enabled": False              # Şimdilik kapalı
     },
     
     # Adaptive loss konfigürasyonu
     "adaptive": {
-        "enabled": True,
-        "adaptation_rate": 0.005,  # Daha yavaş adaptasyon
+        "enabled": False,             # Şimdilik kapalı - daha basit yaklaşım
+        "adaptation_rate": 0.002,     # Daha yavaş adaptasyon
         "target_ratios": {
-            "l1": 0.3,
-            "perceptual": 0.2,
-            "ms_ssim": 0.1,
-            "vq": 0.3,
-            "entropy": 0.1
+            "l1": 0.4,
+            "perceptual": 0.4,
+            "vq": 0.15,
+            "entropy": 0.05
         }
-    },
+    }, 
     
     # Warmup konfigürasyonu
     "warmup": {
         "enabled": True,
-        "epochs": 15,  # İlk 15 epoch warmup
+        "epochs": 10,                 # 15'ten 10'a düşürüldü
         "schedule": {
-            "perceptual": "quadratic",  # Perceptual loss için kademeli
-            "ms_ssim": "linear"         # MS-SSIM için doğrusal
+            "perceptual": "quadratic"  # Sadece perceptual için warmup
         }
     }
 }
 
 # Eğitim yapılandırması
 TRAIN_CONFIG = {
-    "batch_size": 20,          # Perceptual loss için biraz düşürüldü (GPU memory)
-    "num_workers": 4,
-    "learning_rate": 6e-5,     # Daha kararlı eğitim için düşürüldü
+    "batch_size": 24,          # 20'den arttırıldı
+    "learning_rate": 8e-5,
     "weight_decay": 1e-5,
-    "epochs": 200,             # Daha uzun eğitim - perceptual loss için gerekli
+    "epochs": 150,
     "save_every": 5,
-    "early_stopping_patience": 30,  # Daha uzun sabır
+    "early_stopping_patience": 25,  # Daha uzun sabır
     
-    # Loss ağırlıkları (LOSS_CONFIG'e taşındı ama geriye uyumluluk için)
+    # Geriye uyumluluk için (kullanılmıyor ama kalsın)
     "reconstruction_weight": 1.0,
     "vq_weight": 1.0,
     "entropy_weight": 0.01,
-    "perceptual_weight": 0.2,  # YENİ
-    "ms_ssim_weight": 0.15,    # YENİ
+    "perceptual_weight": 0.5,     # Güncellendi
+    "ms_ssim_weight": 0.0,        # Kapatıldı
     
     "max_train_samples": None,
     "max_val_samples": None,
@@ -118,9 +116,9 @@ TRAIN_CONFIG = {
     # Learning rate scheduler
     "scheduler": {
         "type": "cosine_restart",
-        "T_0": 40,                 # Daha uzun cycle
+        "T_0": 30,                 # Daha kısa cycle
         "T_mult": 2,
-        "eta_min": 5e-7           # Daha düşük minimum
+        "eta_min": 1e-6
     },
     
     # Gradient clipping - perceptual loss için kritik
@@ -188,49 +186,4 @@ COMPRESSION_CONFIG = {
     "arithmetic_coder_precision": 32
 }
 
-# Optimizasyon yapılandırması
-OPTIMIZATION_CONFIG = {
-    "warmup_epochs": 15,        # Loss warmup ile uyumlu
-    "gradient_clip_norm": 1.0,
-    "accumulation_steps": 2,
-    
-    # Multi-scale training - perceptual loss için faydalı
-    "multiscale_training": {
-        "enabled": True,
-        "scales": [224, 256, 288],  # Daha az agresif
-        "change_frequency": 8       # Daha az sık değişim
-    },
-    
-    # Mixed precision training
-    "mixed_precision": {
-        "enabled": True,
-        "opt_level": "O1"  # Daha kararlı
-    }
-}
 
-# Logging ve monitoring
-LOGGING_CONFIG = {
-    "log_every": 50,  # Her 50 batch'te log
-    "image_log_every": 5,  # Her 5 epoch'ta örnek görüntüler
-    "tensorboard": {
-        "enabled": True,
-        "log_dir": "runs",
-        "log_images": True,
-        "log_histograms": False  # GPU memory tasarrufu
-    },
-    "wandb": {
-        "enabled": False,  # İsteğe bağlı
-        "project_name": "vq-compression",
-        "entity": None
-    }
-}
-
-# Model checkpoint stratejisi
-CHECKPOINT_CONFIG = {
-    "save_best_only": False,
-    "save_last": True,
-    "save_top_k": 3,
-    "monitor": "val_loss",
-    "mode": "min",
-    "auto_resume": True
-}

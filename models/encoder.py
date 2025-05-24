@@ -24,16 +24,13 @@ class Encoder(nn.Module):
         # Downsampling layers with progressive channel expansion
         self.downsample_layers = nn.ModuleList()
         
-        # Sadece son iki downsampling sonrası attention kullanacağız (belleği korumak için)
-        self.attention_modules = nn.ModuleList()
-        
         # Channel dimensions for each layer
         channels = [latent_channels//4]
         for i in range(ds_num_layers):
             next_ch = min(channels[-1] * 2, latent_channels)
             channels.append(next_ch)
         
-        # Create downsampling blocks
+        # Create downsampling blocks (without intermediate attention)
         for i in range(ds_num_layers):
             in_ch = channels[i]
             out_ch = channels[i+1]
@@ -47,20 +44,10 @@ class Encoder(nn.Module):
             )
             
             self.downsample_layers.append(down_block)
-            
-            # Sadece son iki katmana attention ekle
-            if use_attention and i >= ds_num_layers - 2:
-                self.attention_modules.append(SelfAttention(out_ch))
         
         # Additional processing layers without downsampling
         num_extra_layers = max(0, num_layers - ds_num_layers)
         self.extra_layers = nn.ModuleList()
-        
-        # Extra katmanlarda da seçici olarak attention kullan
-        if num_extra_layers > 0 and use_attention:
-            self.extra_attention = SelfAttention(channels[-1])
-        else:
-            self.extra_attention = None
         
         for _ in range(num_extra_layers):
             self.extra_layers.append(
@@ -72,7 +59,7 @@ class Encoder(nn.Module):
                 )
             )
         
-        # Final attention sadece gerekliyse kullan
+        # Only final attention (if enabled)
         if use_attention:
             self.final_attention = SelfAttention(channels[-1])
         else:
@@ -87,16 +74,9 @@ class Encoder(nn.Module):
         # Store intermediate features for possible skip connections
         features = [x]
         
-        # Apply downsampling layers with selective attention
-        for i, layer in enumerate(self.downsample_layers):
+        # Apply downsampling layers (no intermediate attention)
+        for layer in self.downsample_layers:
             x = layer(x)
-            
-            # Burası değiştirildi
-            if self.use_attention and i >= len(self.downsample_layers) - 2:
-                attention_idx = i - (len(self.downsample_layers) - 2)
-                if attention_idx < len(self.attention_modules):
-                    x = self.attention_modules[attention_idx](x)
-
             features.append(x)
         
         # Apply extra processing layers
@@ -104,7 +84,7 @@ class Encoder(nn.Module):
             x = layer(x)
             features.append(x)
         
-        # Sadece tek bir final attention uygula (eğer aktifse)
+        # Apply final attention only
         if self.final_attention is not None:
             x = self.final_attention(x)
             

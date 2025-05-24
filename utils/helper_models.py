@@ -1,105 +1,123 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
-# attension mekanizması yeni eklendi !
-class SelfAttention(nn.Module):
-    def __init__(self, channels, num_heads=8, reduction_factor=2, use_positional=True):
+class OptimizedSelfAttention(nn.Module):
+    """
+    Memory-efficient Self Attention with dynamic positional encoding
+    """
+    def __init__(self, channels, num_heads=4, reduction_factor=4, dropout=0.1):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.reduction_factor = reduction_factor
-        self.use_positional = use_positional
         
         # Head dimension kontrolü
         assert channels % num_heads == 0, f"Channels {channels} must be divisible by num_heads {num_heads}"
         self.head_dim = channels // num_heads
         
-        # Daha az agresif spatial reduction
+        # Spatial reduction (daha agresif - memory için)
         if reduction_factor > 1:
-            self.spatial_reduce = nn.Conv2d(channels, channels, 
-                                          kernel_size=reduction_factor, 
-                                          stride=reduction_factor, 
-                                          padding=0, groups=channels//4)
+            self.spatial_reduce = nn.AvgPool2d(kernel_size=reduction_factor, stride=reduction_factor)
+            self.spatial_restore = nn.Upsample(scale_factor=reduction_factor, mode='bilinear', align_corners=False)
         else:
             self.spatial_reduce = None
-            
-        # Multi-head projections
-        self.query = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.key = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.value = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+            self.spatial_restore = None
         
-        # Output projection
+        # Lightweight projections
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.proj_drop = nn.Dropout(0.1)
+        self.proj_drop = nn.Dropout(dropout)
         
-        # Learnable scaling parameter (başlangıçta küçük)
+        # Learnable scaling parameter (başlangıçta çok küçük)
         self.gamma = nn.Parameter(torch.zeros(1))
         
-        # Layer normalization
-        self.norm = nn.GroupNorm(num_groups=min(32, channels//4), num_channels=channels)
+        # Layer normalization (GroupNorm daha memory efficient)
+        self.norm = nn.GroupNorm(num_groups=min(8, channels//8), num_channels=channels)
         
-        # Positional encoding (opsiyonel)
-        if use_positional:
-            self.pos_embedding = nn.Parameter(torch.randn(1, channels, 32, 32) * 0.02)
-        else:
-            self.pos_embedding = None
-            
+        # Temperature parameter for attention
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        
+    def _create_positional_encoding(self, h, w, channels, device):
+        """Dynamic positional encoding creation"""
+        # Sinusoidal positional encoding
+        pe = torch.zeros(1, channels, h, w, device=device)
+        
+        # Y pozisyonu için encoding
+        y_pos = torch.arange(h, device=device).float().unsqueeze(1).repeat(1, w)
+        # X pozisyonu için encoding  
+        x_pos = torch.arange(w, device=device).float().unsqueeze(0).repeat(h, 1)
+        
+        # Channel'ları ikiye böl (yarısı x, yarısı y için)
+        div_term = torch.exp(torch.arange(0, channels//2, 2, device=device).float() * 
+                            -(math.log(10000.0) / (channels//2)))
+        
+        # Y pozisyonu encoding
+        pe[0, 0::4, :, :] = torch.sin(y_pos.unsqueeze(0) * div_term.unsqueeze(1).unsqueeze(2))
+        pe[0, 1::4, :, :] = torch.cos(y_pos.unsqueeze(0) * div_term.unsqueeze(1).unsqueeze(2))
+        
+        # X pozisyonu encoding
+        pe[0, 2::4, :, :] = torch.sin(x_pos.unsqueeze(0) * div_term.unsqueeze(1).unsqueeze(2))
+        pe[0, 3::4, :, :] = torch.cos(x_pos.unsqueeze(0) * div_term.unsqueeze(1).unsqueeze(2))
+        
+        return pe * 0.01  # Küçük scale factor
+        
     def forward(self, x):
         B, C, H, W = x.shape
         
+        # Skip attention for very small spatial dimensions
+        if H * W < 64:  # 8x8'den küçükse skip et
+            return x
+            
         # Normalization
         identity = x
         x = self.norm(x)
         
-        # Spatial reduction if needed (daha az agresif)
-        if self.spatial_reduce is not None and H > 16 and W > 16:
+        # Spatial reduction if needed
+        if self.spatial_reduce is not None and H > 32 and W > 32:
             x_reduced = self.spatial_reduce(x)
             _, _, H_r, W_r = x_reduced.shape
         else:
             x_reduced = x
             H_r, W_r = H, W
-            
-        # Positional encoding
-        if self.pos_embedding is not None:
-            pos_emb = F.interpolate(self.pos_embedding, size=(H_r, W_r), mode='bilinear', align_corners=False)
-            x_reduced = x_reduced + pos_emb
         
-        # Compute Q, K, V
-        q = self.query(x_reduced)  # B, C, H_r, W_r
-        k = self.key(x_reduced)    # B, C, H_r, W_r  
-        v = self.value(x_reduced)  # B, C, H_r, W_r
+        # Dynamic positional encoding
+        pos_emb = self._create_positional_encoding(H_r, W_r, C, x.device)
+        x_reduced = x_reduced + pos_emb
+        
+        # Compute Q, K, V in one go
+        qkv = self.qkv(x_reduced).chunk(3, dim=1)  # Split into Q, K, V
+        q, k, v = qkv
         
         # Reshape for multi-head attention
-        q = q.view(B, self.num_heads, self.head_dim, H_r * W_r).permute(0, 1, 3, 2)  # B, heads, HW, head_dim
+        q = q.view(B, self.num_heads, self.head_dim, H_r * W_r)  # B, heads, head_dim, HW
         k = k.view(B, self.num_heads, self.head_dim, H_r * W_r)  # B, heads, head_dim, HW
-        v = v.view(B, self.num_heads, self.head_dim, H_r * W_r).permute(0, 1, 3, 2)  # B, heads, HW, head_dim
+        v = v.view(B, self.num_heads, self.head_dim, H_r * W_r)  # B, heads, head_dim, HW
         
-        # Scaled dot-product attention with memory optimization
-        scale = self.head_dim ** -0.5
+        # Efficient attention computation
+        # Scale queries
+        q = q * (self.head_dim ** -0.5)
         
-        # Chunked attention for memory efficiency
-        chunk_size = min(H_r * W_r, 256)  # Process in chunks
-        attn_output = torch.zeros_like(v)
+        # Apply temperature
+        q = q * self.temperature
         
-        for i in range(0, H_r * W_r, chunk_size):
-            end_i = min(i + chunk_size, H_r * W_r)
-            q_chunk = q[:, :, i:end_i]  # B, heads, chunk, head_dim
-            
-            # Compute attention for this chunk
-            attn_chunk = torch.matmul(q_chunk, k) * scale  # B, heads, chunk, HW
-            attn_chunk = F.softmax(attn_chunk, dim=-1)
-            
-            # Apply attention
-            attn_output[:, :, i:end_i] = torch.matmul(attn_chunk, v)
+        # Compute attention with memory-efficient implementation
+        if H_r * W_r > 1024:  # Large spatial size için chunked attention
+            attn_output = self._chunked_attention(q, k, v, H_r, W_r)
+        else:
+            # Standard attention for smaller sizes
+            attn = torch.matmul(q.transpose(-2, -1), k)  # B, heads, HW, HW
+            attn = F.softmax(attn, dim=-1)
+            attn_output = torch.matmul(attn, v.transpose(-2, -1))  # B, heads, HW, head_dim
+            attn_output = attn_output.transpose(-2, -1)  # B, heads, head_dim, HW
         
-        # Reshape back
-        attn_output = attn_output.permute(0, 1, 3, 2).contiguous()
-        attn_output = attn_output.view(B, C, H_r, W_r)
+        # Reshape back to spatial format
+        attn_output = attn_output.contiguous().view(B, C, H_r, W_r)
         
-        # Interpolate back to original size if needed
+        # Restore spatial dimensions if reduced
         if H_r != H or W_r != W:
-            attn_output = F.interpolate(attn_output, size=(H, W), mode='bilinear', align_corners=False)
+            attn_output = self.spatial_restore(attn_output)
         
         # Output projection
         attn_output = self.proj(attn_output)
@@ -107,21 +125,44 @@ class SelfAttention(nn.Module):
         
         # Residual connection with learnable scaling
         return identity + self.gamma * attn_output
+    
+    def _chunked_attention(self, q, k, v, h, w):
+        """Memory-efficient chunked attention"""
+        B, num_heads, head_dim, spatial_size = q.shape
+        chunk_size = min(256, spatial_size)  # Adaptive chunk size
+        
+        attn_output = torch.zeros_like(v)
+        
+        for i in range(0, spatial_size, chunk_size):
+            end_i = min(i + chunk_size, spatial_size)
+            q_chunk = q[:, :, :, i:end_i]  # B, heads, head_dim, chunk
+            
+            # Compute attention for this chunk
+            attn_chunk = torch.matmul(q_chunk.transpose(-2, -1), k)  # B, heads, chunk, spatial_size
+            attn_chunk = F.softmax(attn_chunk, dim=-1)
+            
+            # Apply attention
+            out_chunk = torch.matmul(attn_chunk, v.transpose(-2, -1))  # B, heads, chunk, head_dim
+            attn_output[:, :, :, i:end_i] = out_chunk.transpose(-2, -1)
+        
+        return attn_output
 
 
-class ChannelAttention(nn.Module):
+class LightweightChannelAttention(nn.Module):
     """
-    Channel-wise attention modülü - spatial attention'a alternatif/ek
+    Lightweight channel attention - spatial attention'a alternatif
     """
-    def __init__(self, channels, reduction=16):
+    def __init__(self, channels, reduction=8):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         
+        # Daha küçük bottleneck
+        mid_channels = max(channels // reduction, 8)
         self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False)
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
         
         self.sigmoid = nn.Sigmoid()
@@ -133,64 +174,43 @@ class ChannelAttention(nn.Module):
         return x * self.sigmoid(out)
 
 
-class HybridAttention(nn.Module):
+class EfficientResidualBlock(nn.Module):
     """
-    Spatial ve channel attention'ı birleştiren hibrit modül
+    Memory-efficient residual block with optional attention
     """
-    def __init__(self, channels, num_heads=8, reduction_factor=2):
-        super().__init__()
-        self.spatial_attn = SelfAttention(channels, num_heads, reduction_factor)
-        self.channel_attn = ChannelAttention(channels)
-        
-        # Attention türlerini dengelemek için learnable weights
-        self.spatial_weight = nn.Parameter(torch.tensor(0.5))
-        self.channel_weight = nn.Parameter(torch.tensor(0.5))
-        
-    def forward(self, x):
-        # İki attention türünü sıralı uygula
-        x_spatial = self.spatial_attn(x)
-        x_channel = self.channel_attn(x_spatial)
-        
-        # Weighted combination
-        spatial_contrib = self.spatial_weight * (x_spatial - x)
-        channel_contrib = self.channel_weight * (x_channel - x_spatial)
-        
-        return x + spatial_contrib + channel_contrib
-
-class ResidualBlock(nn.Module):
-    """
-    Residual block for image processing with batch normalization
-    """
-    def __init__(self, channels, use_attention=True, attention_type="hybrid"):
+    def __init__(self, channels, use_attention=True, attention_type="channel"):
         super().__init__()
         
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.GroupNorm(num_groups=min(32, channels//4), num_channels=channels)
+        # Depthwise separable convolution for efficiency
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        )
+        self.norm1 = nn.GroupNorm(num_groups=min(8, channels//8), num_channels=channels)
         
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.GroupNorm(num_groups=min(32, channels//4), num_channels=channels)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        )
+        self.norm2 = nn.GroupNorm(num_groups=min(8, channels//8), num_channels=channels)
         
-        # Attention modülü
-        if use_attention:
-            if attention_type == "spatial":
-                self.attention = SelfAttention(channels, num_heads=8)
-            elif attention_type == "channel":
-                self.attention = ChannelAttention(channels)
-            elif attention_type == "hybrid":
-                self.attention = HybridAttention(channels)
-            else:
-                self.attention = None
+        # Attention selection - sadece channel attention kullan (memory için)
+        if use_attention and attention_type == "channel":
+            self.attention = LightweightChannelAttention(channels)
+        elif use_attention and attention_type == "spatial":
+            # Sadece küçük spatial size'larda spatial attention kullan
+            self.attention = OptimizedSelfAttention(channels, num_heads=2, reduction_factor=4)
         else:
             self.attention = None
             
         # Activation
-        self.activation = nn.GELU()  # ReLU yerine GELU
+        self.activation = nn.GELU()
         
     def forward(self, x):
         identity = x
         
-        out = self.activation(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = self.activation(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
         
         # Attention uygula
         if self.attention is not None:
@@ -198,3 +218,9 @@ class ResidualBlock(nn.Module):
         
         out += identity
         return self.activation(out)
+
+
+# Backward compatibility için
+SelfAttention = OptimizedSelfAttention
+ChannelAttention = LightweightChannelAttention  
+ResidualBlock = EfficientResidualBlock

@@ -55,7 +55,8 @@ def create_model():
     vq = VectorQuantizerEMA(
         num_embeddings=MODEL_CONFIG['vq']['num_embeddings'],
         embedding_dim=MODEL_CONFIG['vq']['embedding_dim'],
-        commitment_coef=MODEL_CONFIG['vq']['commitment_coef']
+        commitment_coef=MODEL_CONFIG['vq']['commitment_coef'],
+        debug= True
     )
     
     decoder = Decoder(
@@ -80,7 +81,7 @@ def create_model():
     
     return model
 
-def create_loss_function(device, use_adaptive=False):
+def create_loss_function(device, use_adaptive=False): # Burası zaten false'ta adaptive weights kullanılmayacak
     """Loss fonksiyonu oluştur"""
     if use_adaptive:
         initial_weights = LOSS_CONFIG['weights']
@@ -161,6 +162,12 @@ def train_epoch(model, train_loader, optimizer, criterion, epoch, device,
         
         # İleri geçiş
         recon, indices, logits, vq_loss = model(images)
+
+        # VQ ema health debug için
+        if batch_idx % 100 == 0:
+            health = model.vq.get_health_status()
+            if not health['healthy']:
+                print(f"VQ Issues at epoch {epoch}, batch {batch_idx}: {health['issues']}")
         
         # Entropi kaybını hesapla
         entropy_loss = calculate_entropy_loss(logits, indices)
@@ -211,10 +218,14 @@ def train_epoch(model, train_loader, optimizer, criterion, epoch, device,
         # Gradient clipping kontrol
         if TRAIN_CONFIG.get('gradient_clipping', {}).get('enabled', False):
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
-                TRAIN_CONFIG['gradient_clipping']['max_norm']
-            )
+
+            vq_params = list(model.vq.parameters())
+            if vq_params:
+                torch.nn.utils.clip_grad_norm_(vq_params, max_norm=0.5)  # VQ için daha düşük norm
+
+            other_params = [p for name, p in model.named_parameters() if not name.startswith('vq.')]
+            torch.nn.utils.clip_grad_norm_(other_params, TRAIN_CONFIG['gradient_clipping']['max_norm'])
+
             optimizer.step()
         else:
             total_loss.backward()
@@ -326,6 +337,14 @@ def validate_epoch(model, val_loader, criterion, device, adaptive_weights=None):
 def save_checkpoint(model, optimizer, epoch, loss_dict, save_path, 
                    adaptive_weights=None, scheduler=None):
     """Model durumunu kaydet"""
+
+    health = model.vq.get_health_status()
+    if not health['healthy']:
+        print(f"WARNING: Saving unhealthy VQ model at epoch {epoch}")
+        print(f"Issues: {health['issues']}")
+        # Corruption counter'ı sıfırla
+        model.vq.reset_corruption_counter()
+
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
     checkpoint = {
@@ -333,6 +352,7 @@ def save_checkpoint(model, optimizer, epoch, loss_dict, save_path,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss_dict': loss_dict,
+        'vq_health': health,
         'config': {
             'model_config': MODEL_CONFIG,
             'train_config': TRAIN_CONFIG,
@@ -466,6 +486,13 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         # Progressive augmentation güncelleme
         update_progressive_augmentation(train_dataset, epoch)
+
+        # Epoch başında VQ durumu kontrol et
+        vq_stats = model.vq.get_codebook_usage()
+        if epoch % 10 == 0:
+            print(f"VQ Stats - Usage: {vq_stats['usage_ratio']:.2%}, "
+                  f"Entropy: {vq_stats['normalized_entropy']:.3f}, "
+                  f"Corruptions: {vq_stats['corruption_count']}")
         
         # Eğitim
         train_losses = train_epoch(

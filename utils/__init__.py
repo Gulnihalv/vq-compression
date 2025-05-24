@@ -18,7 +18,6 @@ from .metrics import (
 
 from .losses import(
     CombinedLoss,
-    AdaptiveLossWeights,
     calculate_entropy_loss
 )
 

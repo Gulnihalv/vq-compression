@@ -80,7 +80,7 @@ class MS_SSIM_Loss(nn.Module):
     Multi-Scale Structural Similarity Index loss
     """
     def __init__(self, data_range=1.0, size_average=True, channel=3, 
-                 weights=[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]):
+                 weights=[0.4, 0.4, 0.2]):  # 3 scale için optimize edildi
         super().__init__()
         self.data_range = data_range
         self.size_average = size_average
@@ -144,15 +144,15 @@ class MS_SSIM_Loss(nn.Module):
         return 1 - sum(ms_ssim_values)  # Return as loss (1 - SSIM)
 
 
-class CombinedLoss(nn.Module):
+class CombinedLoss(nn.Module): # Bu class basitleştirildi
     """
-    Görsel sıkıştırma için optimize edilmiş combined loss
+    Basitleştirilmiş combined loss - sadece aktif loss'lar
     """
     def __init__(self, 
                  l1_weight=1.0,
-                 l2_weight=0.5, 
-                 perceptual_weight=0.1,
-                 ms_ssim_weight=0.2,
+                 l2_weight=0.0,        # Genelde kapalı
+                 perceptual_weight=0.3,
+                 ms_ssim_weight=0.0,   # Genelde kapalı
                  vq_weight=1.0,
                  entropy_weight=0.01):
         super().__init__()
@@ -164,60 +164,71 @@ class CombinedLoss(nn.Module):
         self.vq_weight = vq_weight
         self.entropy_weight = entropy_weight
         
-        # Loss modules
-        self.perceptual_loss = PerceptualLoss()
-        self.ms_ssim_loss = MS_SSIM_Loss()
+        # Loss modules - sadece aktif olanlar
+        if self.perceptual_weight > 0:
+            self.perceptual_loss = PerceptualLoss(
+                layers=['relu_2_1', 'relu_3_1'],  # Sadece 2 katman
+                weights=[0.5, 0.5]
+            )
+        
+        if self.ms_ssim_weight > 0:
+            self.ms_ssim_loss = MS_SSIM_Loss(
+                weights=[0.4, 0.4, 0.2]  # 3 scale'e düşürüldü
+            )
         
     def forward(self, pred, target, vq_loss, entropy_loss):
         """
-        Compute combined loss
-        
-        Args:
-            pred: Reconstructed image
-            target: Original image  
-            vq_loss: Vector quantization loss
-            entropy_loss: Entropy coding loss
+        Sadece aktif loss'ları hesapla
         """
         losses = {}
         
-        # Reconstruction losses
+        # Her zaman aktif olan loss'lar
         l1_loss = F.l1_loss(pred, target)
-        l2_loss = F.mse_loss(pred, target)
         losses['l1'] = l1_loss
-        losses['l2'] = l2_loss
         
-        # Perceptual loss
-        if self.perceptual_weight > 0:
+        # L2 sadece ağırlık > 0 ise
+        if self.l2_weight > 0:
+            l2_loss = F.mse_loss(pred, target)
+            losses['l2'] = l2_loss
+        else:
+            losses['l2'] = torch.tensor(0.0, device=pred.device)
+        
+        # Perceptual loss - sadece ağırlık > 0 ise
+        if self.perceptual_weight > 0 and hasattr(self, 'perceptual_loss'):
             perc_loss = self.perceptual_loss(pred, target)
             losses['perceptual'] = perc_loss
         else:
-            perc_loss = 0
             losses['perceptual'] = torch.tensor(0.0, device=pred.device)
         
-        # MS-SSIM loss
-        if self.ms_ssim_weight > 0:
+        # MS-SSIM loss - sadece ağırlık > 0 ise
+        if self.ms_ssim_weight > 0 and hasattr(self, 'ms_ssim_loss'):
             ssim_loss = self.ms_ssim_loss(pred, target)
             losses['ms_ssim'] = ssim_loss
         else:
-            ssim_loss = 0
             losses['ms_ssim'] = torch.tensor(0.0, device=pred.device)
         
-        # VQ and entropy losses
+        # VQ ve entropy her zaman aktif
         losses['vq'] = vq_loss
         losses['entropy'] = entropy_loss
         
-        # Total loss
+        # Total loss - sadece aktif olanları topla
         total_loss = (self.l1_weight * l1_loss + 
-                     self.l2_weight * l2_loss +
-                     self.perceptual_weight * perc_loss +
-                     self.ms_ssim_weight * ssim_loss +
                      self.vq_weight * vq_loss +
                      self.entropy_weight * entropy_loss)
+        
+        # Opsiyonel loss'ları ekle
+        if self.l2_weight > 0:
+            total_loss += self.l2_weight * losses['l2']
+        
+        if self.perceptual_weight > 0 and hasattr(self, 'perceptual_loss'):
+            total_loss += self.perceptual_weight * losses['perceptual']
+            
+        if self.ms_ssim_weight > 0 and hasattr(self, 'ms_ssim_loss'):
+            total_loss += self.ms_ssim_weight * losses['ms_ssim']
         
         losses['total'] = total_loss
         
         return total_loss, losses
-
 
 class AdaptiveLossWeights(nn.Module):
     """
@@ -296,23 +307,19 @@ def calculate_entropy_loss(logits, indices):
 
 class WarmupLossScheduler:
     """
-    Loss ağırlıklarını eğitimin başında kademeli olarak artıran scheduler
+    Basitleştirilmiş loss warmup scheduler
     """
-    def __init__(self, warmup_epochs=10):
+    def __init__(self, warmup_epochs=5):  # 10'dan 5'e düşürüldü
         self.warmup_epochs = warmup_epochs
         
     def get_loss_multiplier(self, epoch, loss_type='perceptual'):
         """
-        Belirli loss türleri için warmup multiplier döndür
+        Linear warmup - quadratic yerine basit linear
         """
         if epoch >= self.warmup_epochs:
             return 1.0
         
-        # Kademeli artış
+        # Basit linear artış
         multiplier = epoch / self.warmup_epochs
-        
-        # Perceptual loss için daha yavaş warmup
-        if loss_type == 'perceptual':
-            multiplier = multiplier ** 2
         
         return multiplier
