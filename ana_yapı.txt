@@ -1,0 +1,22 @@
+vq_compression/
+├── train.py            # Model eğitimi için ana script
+├── utils/
+│   ├── __init__.py
+│   ├── data_utils.py   # Veri yükleme fonksiyonları
+|   |-- image_utils.py  # veri eğitimde kullanmak için yükleme
+│   |── metrics.py      # PSNR, MS-SSIM gibi metrikler
+|   |__ helper_models.py # self attension, residual blocks gibi methodlar 
+|   |__ losses.py        # loss fonksiyonları
+├── models/
+│   ├── __init__.py
+│   ├── encoder.py      # Encoder modeli
+│   ├── decoder.py      # Decoder modeli
+│   ├── vq.py           # Vector Quantizer
+│   └── entropy.py      # Entropi modeli
+├── compression/
+│   ├── __init__.py
+│   ├── arithmetic_coding.py  # Aritmetik kodlama uygulamaları
+│   ├── compress.py     # Sıkıştırma fonksiyonları
+│   └── decompress.py   # Açma fonksiyonları
+├── config.py           # Konfigürasyon değişkenleri
+└── demo.py             # Model demo ve test
